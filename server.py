@@ -6,17 +6,24 @@ import json,requests
 from urllib.parse import unquote
 from urllib import parse
 from socketserver  import ThreadingMixIn
+from WXBizMsgCrypt3 import WXBizMsgCrypt
+import xml.etree.cElementTree as ET
+import sys
 
 #监听IP、端口
 host = ('0.0.0.0', 9001)
 #自动分段长度
 length=1000
 #企业微信应用key
-botskey={"default":[企业ID1,Secret1,AgentID1],"bot2":[企业ID2,Secret2,AgentID2]}
+#可在url中指定botID=botskey的key值的方式来选择向哪个BOT发送信息，第一个botskey的key必须为default，即默认bot，当url中不包含该参数默认使用该bot
+botskey={"default":["企业ID","应用key","应用ID"],"应用名称":["企业ID","应用key","应用ID"]}
 #接口访问key
 key=""
 #返回报文格式
 result={"result":"","text":"","botID":""}
+#企业微信后台上设置参数，用于解密用户发送的消息
+#在企微应用后台设置回复API地址为http://IP:PORT/key/respkey的key/,程序根据respkey的key值判断使用哪个bot的解密参数
+respkey={"机器人ID":["token","AES KEY","企业ID"],"机器人ID":["token","AES KEY","企业ID"]}
 
 #自动分段
 def send_to_wecom(text,botID): 
@@ -54,15 +61,47 @@ def send_to_wecom1(text,botID,wecom_touid='@all'):
     else:
         return False
 
+#对发送的消息进行处理
+def resp(message,bot_id):
+    return "发送的消息是："+message+"\nbotID为："+bot_id
+
+#获取botID
+def get_botID(agentid):
+    for item in botskey.items():
+        if (item[1][2]==agentid):
+            return item[0]
+
+#获取应答bot            
+def get_resp_bot(path):
+    for item in respkey.items():
+        if (item[0] in path) == True:
+            return item[0]
+    
 class Resquest(BaseHTTPRequestHandler):   
     def do_GET(self):
-        #验证访问KEY
+        #判断key是否正确
         if (key in self.path) != True :
             data = '''<script>window.location.href='https://www.baidu.com';</script>'''
             self.send_response(200)
             self.send_header('Content-type', 'text/html; charset=UTF-8')
             self.end_headers()
             self.wfile.write(data.encode())
+            return
+        #企微URL验证
+        if("msg_signature" in self.path) == True:
+            bot=get_resp_bot(self.path)
+            wxcpt=WXBizMsgCrypt(respkey[bot][0],respkey[bot][1],respkey[bot][2])
+            path= parse.urlparse(self.path)
+            query=parse.parse_qs(path.query)
+            sVerifyMsgSig = query["msg_signature"][0]
+            sVerifyTimeStamp = query["timestamp"][0]
+            sVerifyNonce = query["nonce"][0]
+            sVerifyEchoStr = query["echostr"][0]
+            ret,sEchoStr=wxcpt.VerifyURL(sVerifyMsgSig, sVerifyTimeStamp,sVerifyNonce,sVerifyEchoStr)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(sEchoStr)
+            print("[DEBUG]企微URL验证")
             return
         #获取botID
         path= parse.urlparse(self.path)
@@ -85,11 +124,11 @@ class Resquest(BaseHTTPRequestHandler):
         #使用base64及URL编码方式解码并发送
         try:
             text=base64.b64decode(temp).decode('utf8')
-            print(text)
+            print("[DEBUG]GET方式发送消息："+text)
             send_to_wecom(text,botID)
         except:
             text=unquote(temp,'utf-8')
-            print(text)
+            print("[DEBUG]GET方式发送消息："+text)
             send_to_wecom(text,botID)
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
@@ -98,13 +137,34 @@ class Resquest(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(result).encode())
 
     def do_POST(self):
-        #验证访问KEY
+        #判断key是否正确
         if (key in self.path) != True :
             data = '''<script>window.location.href='https://www.baidu.com';</script>'''
             self.send_response(200)
             self.send_header('Content-type', 'text/html; charset=UTF-8')
             self.end_headers()
             self.wfile.write(data.encode())
+            return
+        #处理企微发送的消息
+        if("msg_signature" in self.path) == True:
+            bot=get_resp_bot(self.path)
+            wxcpt=WXBizMsgCrypt(respkey[bot][0],respkey[bot][1],respkey[bot][2])
+            path= parse.urlparse(self.path)
+            query=parse.parse_qs(path.query)
+            sReqMsgSig = query["msg_signature"][0]
+            sReqTimeStamp = query["timestamp"][0]
+            sReqNonce = query["nonce"][0]
+            sReqData = self.rfile.read(int(self.headers['content-length']))
+            ret,sMsg=wxcpt.DecryptMsg( sReqData, sReqMsgSig, sReqTimeStamp, sReqNonce)
+            xml_tree = ET.fromstring(sMsg)
+            content = xml_tree.find("Content").text
+            agnetid = xml_tree.find("AgentID").text
+            print("[DEBUG]企微接收消息："+content+" 应用ID："+agnetid)
+            #直接回复企微200，异步回复用户信息
+            self.send_response(200)
+            self.end_headers()
+            bot_id=get_botID(agnetid)
+            send_to_wecom(resp(content,bot_id),bot_id)
             return
         #获取botID
         path= parse.urlparse(self.path)
@@ -138,11 +198,11 @@ class Resquest(BaseHTTPRequestHandler):
         #使用base64及URL编码方式解码并发送
         try:
             text=base64.b64decode(temp.group(1)).decode('utf8')
-            print(text)
+            print("[DEBUG]POST方式发送消息："+text)
             send_to_wecom(text,botID)
         except:
             text=unquote(temp.group(1),'utf-8')
-            print(text)
+            print("[DEBUG]POST方式发送消息："+text)
             send_to_wecom(text,botID)
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
